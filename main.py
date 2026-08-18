@@ -1,10 +1,8 @@
-#!/usr/bin/env python3
-
 import json
 import time
 import math
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 import os
 import signal
 import sys
@@ -22,6 +20,11 @@ CLEANUP_INTERVAL = 60
 lightning_data = {}
 data_lock = threading.Lock()
 stats = {"total_received": 0, "active": 0, "vaisala": 0, "nowcast": 0}
+
+def log(msg):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{timestamp}] {msg}")
+    sys.stdout.flush()
 
 def lat_lon_to_grid(lat, lon):
     lat_rad = math.radians(lat)
@@ -88,54 +91,64 @@ def cleanup_old_data():
             
             stats['active'] = len(lightning_data)
 
-def save_geojson(filename="lightning.geojson"):
-    with data_lock:
-        features = []
-        for key, data in lightning_data.items():
-            lat, lon = grid_to_center(key)
-            properties = {
-                'count': data['count'],
-                'age_sec': int(time.time() - data['first_seen']),
-                'source': data['source']
-            }
-            if data['delays']:
-                properties['avg_delay'] = int(sum(data['delays']) / len(data['delays']))
+def save_geojson(filename="lightning.json"):
+    try:
+        with data_lock:
+            features = []
+            for key, data in lightning_data.items():
+                lat, lon = grid_to_center(key)
+                properties = {
+                    'count': data['count'],
+                    'age_sec': int(time.time() - data['first_seen']),
+                    'source': data['source']
+                }
+                if data['delays']:
+                    properties['avg_delay'] = int(sum(data['delays']) / len(data['delays']))
+                
+                feature = {
+                    'type': 'Feature',
+                    'geometry': {
+                        'type': 'Point',
+                        'coordinates': [lon, lat]
+                    },
+                    'properties': properties
+                }
+                features.append(feature)
             
-            feature = {
-                'type': 'Feature',
-                'geometry': {
-                    'type': 'Point',
-                    'coordinates': [lon, lat]
-                },
-                'properties': properties
+            geojson = {
+                'type': 'FeatureCollection',
+                'features': features,
+                'metadata': {
+                    'generated': datetime.now(timezone.utc).isoformat() + 'Z',
+                    'grid_size_km': GRID_SIZE_KM,
+                    'max_age_minutes': MAX_AGE_MINUTES,
+                    'total_cells': len(features),
+                    'total_lightnings': stats['total_received']
+                }
             }
-            features.append(feature)
         
-        geojson = {
-            'type': 'FeatureCollection',
-            'features': features,
-            'metadata': {
-                'generated': datetime.utcnow().isoformat() + 'Z',
-                'grid_size_km': GRID_SIZE_KM,
-                'max_age_minutes': MAX_AGE_MINUTES,
-                'total_cells': len(features),
-                'total_lightnings': stats['total_received']
-            }
-        }
-    
-    with open(filename, 'w') as f:
-        json.dump(geojson, f, separators=(',', ':'))
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump(geojson, f, separators=(',', ':'))
+        return True
+    except Exception as e:
+        log(f"ERROR saving {filename}: {str(e)}")
+        return False
 
 def save_compact_grid(filename="lightning_grid.csv"):
-    with data_lock:
-        lines = ["grid_lat,grid_lon,count,age_sec,source"]
-        for key, data in lightning_data.items():
-            lat, lon = grid_to_center(key)
-            age = int(time.time() - data['first_seen'])
-            lines.append(f"{lat:.6f},{lon:.6f},{data['count']},{age},{data['source']}")
-    
-    with open(filename, 'w') as f:
-        f.write('\n'.join(lines))
+    try:
+        with data_lock:
+            lines = ["grid_lat,grid_lon,count,age_sec,source"]
+            for key, data in lightning_data.items():
+                lat, lon = grid_to_center(key)
+                age = int(time.time() - data['first_seen'])
+                lines.append(f"{lat:.6f},{lon:.6f},{data['count']},{age},{data['source']}")
+        
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(lines))
+        return True
+    except Exception as e:
+        log(f"ERROR saving {filename}: {str(e)}")
+        return False
 
 def sse_listener(url):
     headers = {
@@ -146,7 +159,12 @@ def sse_listener(url):
     
     try:
         response = requests.get(url, headers=headers, stream=True, timeout=30)
-        response.raise_for_status()
+        
+        if response.status_code != 200:
+            log(f"HTTP ERROR {response.status_code}")
+            return False
+        
+        log("Connected successfully")
         
         buffer = ""
         event_type = None
@@ -178,15 +196,18 @@ def sse_listener(url):
                                             event_type.replace('lightning-', ''),
                                             data.get('time_lightning', time.time() * 1000)
                                         )
+                                    
                                     if stats['total_received'] % 50 == 0:
-                                        save_geojson()
+                                        if save_geojson() and save_compact_grid():
+                                            log(f"Successfully saved {stats['total_received']} strikes, {stats['active']} active cells")
                                 event_type = None
                             except json.JSONDecodeError:
                                 pass
                     elif line.startswith(':'):
                         pass
     
-    except requests.exceptions.RequestException:
+    except requests.exceptions.RequestException as e:
+        log(f"HTTP ERROR {str(e)}")
         return False
     except KeyboardInterrupt:
         return False
@@ -194,8 +215,10 @@ def sse_listener(url):
     return True
 
 def signal_handler(sig, frame):
+    log(f"Successfully saved {stats['total_received']} strikes, {stats['active']} active cells")
     save_geojson()
     save_compact_grid()
+    log("Exit")
     sys.exit(0)
 
 def main():
@@ -208,20 +231,23 @@ def main():
         while True:
             time.sleep(15)
             if stats['total_received'] > 0:
-                save_geojson()
-                save_compact_grid()
+                if save_geojson() and save_compact_grid():
+                    log(f"Successfully saved {stats['total_received']} strikes, {stats['active']} active cells")
     
     save_thread = threading.Thread(target=auto_save, daemon=True)
     save_thread.start()
     
     SSE_URL = "https://tiles.wo-cloud.com/live?channels=lightning-nowcast,lightning-vaisala"
+    log(f"Starting, url: {SSE_URL}")
     
     while True:
         try:
             success = sse_listener(SSE_URL)
             if not success:
+                log("Reconnecting in 5 seconds...")
                 time.sleep(5)
-        except Exception:
+        except Exception as e:
+            log(f"HTTP ERROR {str(e)}")
             time.sleep(5)
 
 if __name__ == "__main__":
